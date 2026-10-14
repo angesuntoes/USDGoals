@@ -3862,9 +3862,12 @@ const msalReady = (async () => {
     await instance.initialize();
   }
 
-  // Handle any pending loginRedirect response; log but do not swallow errors
+  // Handle any pending loginRedirect response. Capture (don't swallow) errors
+  // so a failed automatic redirect sign-in is surfaced to the user below.
+  let redirectErr = null;
   const resp = await instance.handleRedirectPromise().catch(function (e) {
     console.warn('[MSAL] handleRedirectPromise error:', e);
+    redirectErr = e;
     return null;
   });
   if (resp && resp.account) {
@@ -3877,13 +3880,19 @@ const msalReady = (async () => {
       onSpSignedIn(accs[0]);
       // Auto-sync silently when a previous session is restored on page load
       setTimeout(function() { spSync(); }, 800);
+    } else if (redirectErr) {
+      // A redirect sign-in returned with an error — show WHY it failed instead
+      // of silently doing nothing, and clear the guard so a manual retry works.
+      showSpBanner();
+      spShowAuthError(redirectErr);
+      try { sessionStorage.removeItem('ekx_sp_autoauth'); } catch (_e) {}
     } else {
       // ── Auto-authenticate on first open ──────────────────────────────────
       // No cached session: initiate sign-in automatically so the dashboard
       // authenticates and refreshes without the user clicking anything.
-      // A one-shot sessionStorage flag prevents redirect loops when auth fails
-      // (e.g. missing admin consent). The flag clears when the tab is closed,
-      // so each fresh open of the link re-attempts automatic authentication.
+      // A one-shot sessionStorage flag prevents redirect loops; it is cleared
+      // on failure (above / below) and when the tab closes, so each fresh open
+      // of the link re-attempts automatic authentication.
       const AUTO_KEY = 'ekx_sp_autoauth';
       if (!sessionStorage.getItem(AUTO_KEY)) {
         sessionStorage.setItem(AUTO_KEY, '1');
@@ -3903,7 +3912,9 @@ const msalReady = (async () => {
             await instance.loginRedirect({ scopes: SP_CONFIG.loginScopes });
           } catch (autoErr) {
             console.warn('[MSAL] Automatic sign-in failed:', autoErr);
-            spStatus('Automatic sign-in unavailable \u2014 click \u201CSign in with Microsoft\u201D.', 'warn');
+            try { sessionStorage.removeItem(AUTO_KEY); } catch (_e2) {}
+            showSpBanner();
+            spShowAuthError(autoErr);
           }
         }
       }
@@ -3969,6 +3980,30 @@ function onSpSignedIn(account) {
   var hdrBtn = document.getElementById('spHdrBtn');
   if (hdrBtn) { hdrBtn.classList.remove('sp-error'); hdrBtn.classList.add('sp-connected'); }
   spStatus('Connected as ' + (account.name || account.username) + ' — click to sync', 'ok');
+}
+
+// ── Classify & surface a Microsoft sign-in error (shared by auto + manual flows) ──
+function spShowAuthError(e) {
+  const errMsg  = (e && (e.errorMessage || e.message) || '').toString();
+  const errCode = (e && e.errorCode || '').toString();
+  if (errMsg.includes('AADSTS65001') || errCode === 'consent_required' || errCode === 'interaction_required') {
+    spToast('Admin consent required \u2014 ask your Microsoft 365 administrator to grant access for this application in Azure Active Directory.');
+    spStatus('Admin consent required. Contact your IT administrator.', 'err');
+  } else if (errMsg.includes('AADSTS700016') || errCode === 'application_not_found') {
+    spToast('Application not found in Azure AD \u2014 verify the App Registration Client ID is correct.');
+    spStatus('App not found in Azure AD \u2014 check App Registration.', 'err');
+  } else if (errMsg.includes('AADSTS50011') || errCode === 'redirect_uri_mismatch') {
+    spToast('Redirect URI mismatch \u2014 register https://pages.github.tools.sap/I321950/USDGoals/ as a SPA Redirect URI in Azure AD.');
+    spStatus('Redirect URI mismatch \u2014 register the page URL as a SPA redirect URI in Azure AD.', 'err');
+  } else if (errMsg.includes('AADSTS90002') || errCode === 'invalid_tenant') {
+    spToast('Tenant not found \u2014 verify the Directory (tenant) ID in SP_CONFIG.');
+    spStatus('Invalid tenant ID \u2014 check configuration.', 'err');
+  } else if (errCode === 'interaction_in_progress') {
+    spStatus('Sign-in already in progress\u2026', 'info');
+  } else {
+    spToast('Sign-in error (' + (errCode || 'unknown') + '): ' + errMsg.slice(0, 160));
+    spStatus('Automatic sign-in failed (' + (errCode || 'see console') + '). Click \u201CSign in with Microsoft\u201D to retry.', 'err');
+  }
 }
 
 // ── Rules 2 & 5: spLogin — const instance = await msalReady at top; popup→redirect, user_cancelled→silent, others→toast ──
